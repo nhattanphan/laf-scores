@@ -94,6 +94,12 @@ def load_fixtures():
     return json.loads(path.read_text())
 
 
+def load_teams_iso():
+    """iso → {id: FIFA code, group: letter} (matches the site's TEAMS object)."""
+    path = Path(__file__).parent / "teams_iso.json"
+    return json.loads(path.read_text())
+
+
 def http_json(url, headers=None, method="GET", body=None):
     req = urllib.request.Request(url, headers=headers or {}, method=method)
     if body is not None:
@@ -187,7 +193,59 @@ def sync_once(fixtures, cache):
         updates += 1
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a} ({m.get('status')})", flush=True)
+    # mark finished matches (needed to know when a group is truly complete)
+    for m in matches:
+        if m.get("status") != "FINISHED":
+            continue
+        mid, _ = match_to_site_id(m, fixtures)
+        if mid and not FINISHED_CACHE.get(mid):
+            firebase_put(f"dailyFinished/{mid}", True)
+            FINISHED_CACHE[mid] = True
+    if updates or any(m.get("status") == "FINISHED" for m in matches):
+        finalize_groups(fixtures, cache)
     return live, updates
+
+
+FINISHED_CACHE = {}
+
+
+def finalize_groups(fixtures, scores):
+    """When all 6 matches of a group are FINISHED, write the final ranking to
+    results/groups/{g} (FIFA codes, positions 1..3) — the node the bracket-game
+    scoring reads. Never overwrites an existing (admin-entered) ranking, so
+    manual corrections always win."""
+    teams_iso = load_teams_iso()
+    existing = firebase_get("results/groups") or {}
+    by_group = {}
+    for f in fixtures:
+        by_group.setdefault(f.get("group") or teams_iso.get(f["home"], {}).get("group"), []).append(f)
+    for g, ms in by_group.items():
+        if not g or g in existing:
+            continue  # unknown group or already finalized (admin wins)
+        mids = [f"{f['date']}_{f['home']}_{f['away']}" for f in ms]
+        if len(mids) < 6 or not all(FINISHED_CACHE.get(mid) for mid in mids):
+            continue
+        # compute standings: pts → goal diff → goals for
+        st = {}
+        for f, mid in zip(ms, mids):
+            r = scores.get(mid)
+            if not r:
+                break
+            for t in (f["home"], f["away"]):
+                st.setdefault(t, {"pts": 0, "gf": 0, "ga": 0})
+            h, a = int(r["h"]), int(r["a"])
+            st[f["home"]]["gf"] += h; st[f["home"]]["ga"] += a
+            st[f["away"]]["gf"] += a; st[f["away"]]["ga"] += h
+            if h > a: st[f["home"]]["pts"] += 3
+            elif a > h: st[f["away"]]["pts"] += 3
+            else: st[f["home"]]["pts"] += 1; st[f["away"]]["pts"] += 1
+        else:
+            order = sorted(st, key=lambda t: (-st[t]["pts"], -(st[t]["gf"] - st[t]["ga"]), -st[t]["gf"]))
+            ids = [teams_iso[t]["id"] for t in order if t in teams_iso]
+            if len(ids) >= 3:
+                firebase_put(f"results/groups/{g}", {"1": ids[0], "2": ids[1], "3": ids[2]})
+                print(f"  🏁 Group {g} complete → final ranking saved: "
+                      f"{ids[0]} / {ids[1]} / {ids[2]}", flush=True)
 
 
 def main():
@@ -195,6 +253,7 @@ def main():
         sys.exit("FOOTBALL_DATA_TOKEN env var is missing.")
     fixtures = load_fixtures()
     cache = firebase_get("dailyResults") or {}
+    FINISHED_CACHE.update(firebase_get("dailyFinished") or {})
 
     poll = int(os.environ.get("POLL_SECONDS", "60"))
     max_minutes = int(os.environ.get("MAX_MINUTES", "0"))  # 0 = single pass
@@ -209,16 +268,37 @@ def main():
     deadline = datetime.now(timezone.utc) + timedelta(minutes=max_minutes)
     idle_polls = 0
     print(f"Live mode: polling every {poll}s until {deadline:%H:%M} UTC.", flush=True)
+
+    def next_kickoff_utc():
+        """Earliest future kickoff (fixtures are CEST = UTC+2 during the tournament)."""
+        now = datetime.now(timezone.utc)
+        best = None
+        for f in fixtures:
+            ko = datetime.fromisoformat(f"{f['date']}T{f['time']}:00+02:00")
+            if ko > now and (best is None or ko < best):
+                best = ko
+        return best
+
     while datetime.now(timezone.utc) < deadline:
         try:
             live, _ = sync_once(fixtures, cache)
             idle_polls = 0 if live else idle_polls + 1
         except Exception as e:  # API hiccup — keep going
             print(f"  ⚠ poll failed: {e}", flush=True)
-        # If no live match for 30 consecutive polls (~30 min), stop early
+
         if idle_polls >= 30:
-            print("No live matches for a while — stopping early.", flush=True)
-            break
+            # nothing live for ~30 min — is a kickoff coming before this session ends?
+            ko = next_kickoff_utc()
+            if ko is None or ko > deadline:
+                print("No live matches and no kickoff before session end — stopping early.", flush=True)
+                break
+            wait = (ko - datetime.now(timezone.utc)).total_seconds()
+            if wait > 360:
+                # idle until ~5 min before kickoff, pinging every 5 min to stay warm
+                print(f"Next kickoff {ko:%H:%M} UTC — idling until then.", flush=True)
+                time.sleep(min(wait - 300, 300))
+                continue
+            idle_polls = 0  # kickoff imminent — resume normal polling
         time.sleep(poll)
     print("Live polling session finished.")
 
