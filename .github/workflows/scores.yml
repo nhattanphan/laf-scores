@@ -1,0 +1,29 @@
+name: Live WC scores
+
+on:
+  schedule:
+    - cron: "55 15 * 6,7 *"
+    - cron: "55 21 * 6,7 *"
+    - cron: "55 3 * 6,7 *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: live-scores
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    if: ${{ github.run_started_at < '2026-07-21' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Poll live scores (every 60s)
+        env:
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          POLL_SECONDS: "60"
+          MAX_MINUTES: "350"
+        run: python update_scores.py
