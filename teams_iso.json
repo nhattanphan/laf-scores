@@ -1,0 +1,194 @@
+{
+"mx": {
+"id": "MEX",
+"group": "A"
+},
+"za": {
+"id": "RSA",
+"group": "A"
+},
+"kr": {
+"id": "KOR",
+"group": "A"
+},
+"cz": {
+"id": "CZE",
+"group": "A"
+},
+"ca": {
+"id": "CAN",
+"group": "B"
+},
+"ch": {
+"id": "SUI",
+"group": "B"
+},
+"qa": {
+"id": "QAT",
+"group": "B"
+},
+"ba": {
+"id": "BIH",
+"group": "B"
+},
+"br": {
+"id": "BRA",
+"group": "C"
+},
+"ma": {
+"id": "MAR",
+"group": "C"
+},
+"ht": {
+"id": "HAI",
+"group": "C"
+},
+"gb-sct": {
+"id": "SCO",
+"group": "C"
+},
+"us": {
+"id": "USA",
+"group": "D"
+},
+"py": {
+"id": "PAR",
+"group": "D"
+},
+"au": {
+"id": "AUS",
+"group": "D"
+},
+"tr": {
+"id": "TUR",
+"group": "D"
+},
+"de": {
+"id": "GER",
+"group": "E"
+},
+"cw": {
+"id": "CUW",
+"group": "E"
+},
+"ci": {
+"id": "CIV",
+"group": "E"
+},
+"ec": {
+"id": "ECU",
+"group": "E"
+},
+"nl": {
+"id": "NED",
+"group": "F"
+},
+"jp": {
+"id": "JPN",
+"group": "F"
+},
+"se": {
+"id": "SWE",
+"group": "F"
+},
+"tn": {
+"id": "TUN",
+"group": "F"
+},
+"be": {
+"id": "BEL",
+"group": "G"
+},
+"eg": {
+"id": "EGY",
+"group": "G"
+},
+"ir": {
+"id": "IRN",
+"group": "G"
+},
+"nz": {
+"id": "NZL",
+"group": "G"
+},
+"es": {
+"id": "ESP",
+"group": "H"
+},
+"cv": {
+"id": "CPV",
+"group": "H"
+},
+"sa": {
+"id": "KSA",
+"group": "H"
+},
+"uy": {
+"id": "URU",
+"group": "H"
+},
+"fr": {
+"id": "FRA",
+"group": "I"
+},
+"sn": {
+"id": "SEN",
+"group": "I"
+},
+"no": {
+"id": "NOR",
+"group": "I"
+},
+"iq": {
+"id": "IRQ",
+"group": "I"
+},
+"ar": {
+"id": "ARG",
+"group": "J"
+},
+"dz": {
+"id": "ALG",
+"group": "J"
+},
+"at": {
+"id": "AUT",
+"group": "J"
+},
+"jo": {
+"id": "JOR",
+"group": "J"
+},
+"pt": {
+"id": "POR",
+"group": "K"
+},
+"cd": {
+"id": "COD",
+"group": "K"
+},
+"uz": {
+"id": "UZB",
+"group": "K"
+},
+"co": {
+"id": "COL",
+"group": "K"
+},
+"gb-eng": {
+"id": "ENG",
+"group": "L"
+},
+"hr": {
+"id": "CRO",
+"group": "L"
+},
+"gh": {
+"id": "GHA",
+"group": "L"
+},
+"pa": {
+"id": "PAN",
+"group": "L"
+}
+}
