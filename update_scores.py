@@ -251,6 +251,9 @@ def finalize_groups(fixtures, scores):
 def main():
     if not API_TOKEN:
         sys.exit("FOOTBALL_DATA_TOKEN env var is missing.")
+    if datetime.now(timezone.utc).date() > datetime(2026, 7, 20, tzinfo=timezone.utc).date():
+        print("Tournament over — nothing to do.")
+        return
     fixtures = load_fixtures()
     cache = firebase_get("dailyResults") or {}
     FINISHED_CACHE.update(firebase_get("dailyFinished") or {})
