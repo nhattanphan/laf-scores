@@ -15,7 +15,6 @@ jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 355
-    if: ${{ github.run_started_at < '2026-07-21' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
