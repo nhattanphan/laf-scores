@@ -21,9 +21,11 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-FIREBASE_URL = os.environ.get(
-    "FIREBASE_URL", "https://laf-wc2026-default-rtdb.firebaseio.com"
-).rstrip("/")
+FIREBASE_URLS = [u.strip().rstrip("/") for u in os.environ.get(
+    "FIREBASE_URLS",
+    "https://laf-wc2026-default-rtdb.firebaseio.com,"
+    "https://wc2026fr-default-rtdb.firebaseio.com"
+).split(",") if u.strip()]
 API_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN", "")
 API_BASE = "https://api.football-data.org/v4"
 
@@ -159,15 +161,20 @@ def extract_score(api_match):
     return int(h), int(a)
 
 
-def firebase_get(path):
+def firebase_get(path, base=None):
     try:
-        return http_json(f"{FIREBASE_URL}/{path}.json")
+        return http_json(f"{base or FIREBASE_URLS[0]}/{path}.json")
     except Exception:
         return None
 
 
 def firebase_put(path, value):
-    http_json(f"{FIREBASE_URL}/{path}.json", method="PUT", body=value)
+    """Write to ALL configured databases (LAF + family share the same fixtures)."""
+    for base in FIREBASE_URLS:
+        try:
+            http_json(f"{base}/{path}.json", method="PUT", body=value)
+        except Exception as e:
+            print(f"  ⚠ write failed on {base}: {e}", flush=True)
 
 
 def sync_once(fixtures, cache):
@@ -215,13 +222,13 @@ def finalize_groups(fixtures, scores):
     scoring reads. Never overwrites an existing (admin-entered) ranking, so
     manual corrections always win."""
     teams_iso = load_teams_iso()
-    existing = firebase_get("results/groups") or {}
+    existing_by_db = {b: (firebase_get("results/groups", b) or {}) for b in FIREBASE_URLS}
     by_group = {}
     for f in fixtures:
         by_group.setdefault(f.get("group") or teams_iso.get(f["home"], {}).get("group"), []).append(f)
     for g, ms in by_group.items():
-        if not g or g in existing:
-            continue  # unknown group or already finalized (admin wins)
+        if not g or all(g in ex for ex in existing_by_db.values()):
+            continue  # unknown group or already finalized everywhere (admin wins)
         mids = [f"{f['date']}_{f['home']}_{f['away']}" for f in ms]
         if len(mids) < 6 or not all(FINISHED_CACHE.get(mid) for mid in mids):
             continue
@@ -243,7 +250,13 @@ def finalize_groups(fixtures, scores):
             order = sorted(st, key=lambda t: (-st[t]["pts"], -(st[t]["gf"] - st[t]["ga"]), -st[t]["gf"]))
             ids = [teams_iso[t]["id"] for t in order if t in teams_iso]
             if len(ids) >= 3:
-                firebase_put(f"results/groups/{g}", {"1": ids[0], "2": ids[1], "3": ids[2]})
+                val = {"1": ids[0], "2": ids[1], "3": ids[2]}
+                for base in FIREBASE_URLS:
+                    if g not in existing_by_db[base]:
+                        try:
+                            http_json(f"{base}/results/groups/{g}.json", method="PUT", body=val)
+                        except Exception as e:
+                            print(f"  ⚠ ranking write failed on {base}: {e}", flush=True)
                 print(f"  🏁 Group {g} complete → final ranking saved: "
                       f"{ids[0]} / {ids[1]} / {ids[2]}", flush=True)
 
