@@ -192,11 +192,17 @@ def sync_once(fixtures, cache):
         h, a = score
         if flipped:
             h, a = a, h
+        minute = None
+        if m.get("status") in ("IN_PLAY", "PAUSED"):
+            minute = m.get("minute") or m.get("score", {}).get("minute")
         new_val = {"h": h, "a": a}
-        if cache.get(mid) == new_val:
+        if minute is not None:
+            new_val["min"] = int(minute)
+        # compare only h/a for change detection (minute always differs)
+        if cache.get(mid) == {"h": h, "a": a} and m.get("status") not in ("IN_PLAY", "PAUSED"):
             continue  # no change → no write
         firebase_put(f"dailyResults/{mid}", new_val)
-        cache[mid] = new_val
+        cache[mid] = {"h": h, "a": a}
         updates += 1
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a} ({m.get('status')})", flush=True)
