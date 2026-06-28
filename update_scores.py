@@ -131,6 +131,8 @@ def match_to_site_id(api_match, fixtures):
         return None, False
     api_date = datetime.fromisoformat(api_match["utcDate"].replace("Z", "+00:00")).date()
     for f in fixtures:
+        if f.get("stage") == "knockout" or "home" not in f or "away" not in f:
+            continue  # knockout fixtures carry no teams here — handled via koFixtures
         site_date = datetime.fromisoformat(f["date"]).date()
         if abs((site_date - api_date).days) > 1:
             continue
@@ -204,7 +206,10 @@ def ko_match_to_site_id(api_match, fixtures, ko_fixtures, id_to_iso):
 
 
 def extract_score(api_match):
-    """Current score for live matches, full-time for finished. None if not started."""
+    """Return (home, away, won_iso) for a match.
+    home/away = the 120-minute score (full-time as reported, excluding penalties).
+    won_iso  = ISO of the winner when a knockout is decided on penalties (else None).
+    Returns None if the match has not produced a usable score yet."""
     status = api_match.get("status", "")
     if status in ("SCHEDULED", "TIMED", "POSTPONED", "CANCELLED"):
         return None
@@ -218,7 +223,19 @@ def extract_score(api_match):
         a = a if a is not None else ht.get("away")
     if h is None or a is None:
         return None
-    return int(h), int(a)
+    h, a = int(h), int(a)
+    # Penalty shootout: when the 120-min score is level but the API names a winner,
+    # capture which side advanced so the bracket can progress automatically.
+    won_iso = None
+    pens = sc.get("penalties", {}) or {}
+    ph, pa = pens.get("home"), pens.get("away")
+    winner = sc.get("winner")  # "HOME_TEAM" | "AWAY_TEAM" | "DRAW" | None
+    if h == a and (winner in ("HOME_TEAM", "AWAY_TEAM") or (ph is not None and pa is not None)):
+        if winner == "HOME_TEAM" or (ph is not None and pa is not None and ph > pa):
+            won_iso = api_name_to_iso(api_match["homeTeam"]["name"])
+        elif winner == "AWAY_TEAM" or (ph is not None and pa is not None and pa > ph):
+            won_iso = api_name_to_iso(api_match["awayTeam"]["name"])
+    return h, a, won_iso
 
 
 def firebase_get(path, base=None):
@@ -252,23 +269,31 @@ def sync_once(fixtures, cache):
             mid, flipped = ko_match_to_site_id(m, fixtures, KO_FIXTURES, ID_TO_ISO)
         if not mid:
             continue
-        h, a = score
+        h, a, won_iso = score
         if flipped:
             h, a = a, h
+            # won_iso is an ISO code, unaffected by home/away flip
         minute = None
         if m.get("status") in ("IN_PLAY", "PAUSED"):
             minute = m.get("minute") or m.get("score", {}).get("minute")
         new_val = {"h": h, "a": a}
         if minute is not None:
             new_val["min"] = int(minute)
-        # compare only h/a for change detection (minute always differs)
-        if cache.get(mid) == {"h": h, "a": a} and m.get("status") not in ("IN_PLAY", "PAUSED"):
+        if won_iso:
+            new_val["won"] = won_iso  # penalty-shootout winner (bracket advances on this)
+        # change detection: compare the meaningful fields (h, a, won)
+        prev = cache.get(mid)
+        cur_cmp = {"h": h, "a": a}
+        if won_iso:
+            cur_cmp["won"] = won_iso
+        if prev == cur_cmp and m.get("status") not in ("IN_PLAY", "PAUSED"):
             continue  # no change → no write
         firebase_put(f"dailyResults/{mid}", new_val)
-        cache[mid] = {"h": h, "a": a}
+        cache[mid] = cur_cmp
         updates += 1
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a} ({m.get('status')})", flush=True)
+        pen_note = f" (pen → {won_iso})" if won_iso else ""
+        print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a}{pen_note} ({m.get('status')})", flush=True)
     # mark finished matches (needed to know when a group is truly complete)
     for m in matches:
         if m.get("status") != "FINISHED":
@@ -298,6 +323,8 @@ def finalize_groups(fixtures, scores):
     existing_by_db = {b: (firebase_get("results/groups", b) or {}) for b in FIREBASE_URLS}
     by_group = {}
     for f in fixtures:
+        if f.get("stage") == "knockout" or "home" not in f:
+            continue  # group standings only use group-stage fixtures
         by_group.setdefault(f.get("group") or teams_iso.get(f["home"], {}).get("group"), []).append(f)
     for g, ms in by_group.items():
         if not g or all(g in ex for ex in existing_by_db.values()):
