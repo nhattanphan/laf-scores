@@ -143,6 +143,66 @@ def match_to_site_id(api_match, fixtures):
     return None, False
 
 
+
+
+# ── KNOCKOUT support ──────────────────────────────────────────────────────────
+# Admin enters knockout matchups in Firebase node `koFixtures`:
+#   koFixtures/{matchN} = {"home": <teamId>, "away": <teamId>}
+# where teamId is the site's FIFA-style id (TEAMS key). We map teamId → iso via
+# teams_iso.json (iso → {id, group}) inverted, then match API results by team pair.
+
+def load_team_id_to_iso():
+    """Return {teamId: iso} by inverting teams_iso.json (iso → {id,...})."""
+    try:
+        teams_iso = load_teams_iso()
+    except Exception:
+        return {}
+    out = {}
+    for iso, info in teams_iso.items():
+        tid = info.get("id")
+        if tid:
+            out[tid] = iso
+    return out
+
+
+def fetch_ko_fixtures():
+    """Read admin-entered knockout matchups from the first Firebase DB."""
+    return firebase_get("koFixtures") or {}
+
+
+def ko_match_to_site_id(api_match, fixtures, ko_fixtures, id_to_iso):
+    """Map an API knockout result to a site matchId using admin-entered koFixtures.
+    Returns (matchId, flipped) or (None, False)."""
+    if not ko_fixtures:
+        return None, False
+    h_iso = api_name_to_iso(api_match["homeTeam"]["name"])
+    a_iso = api_name_to_iso(api_match["awayTeam"]["name"])
+    if not h_iso or not a_iso:
+        return None, False
+    # knockout fixtures by matchN → date
+    ko_dates = {f["matchN"]: f for f in fixtures if f.get("stage") == "knockout"}
+    for mn, pair in ko_fixtures.items():
+        if not isinstance(pair, dict):
+            continue
+        ph, pa = pair.get("home"), pair.get("away")
+        if not ph or not pa:
+            continue
+        set_iso = {id_to_iso.get(ph), id_to_iso.get(pa)}
+        if set_iso == {h_iso, a_iso}:
+            fx = ko_dates.get(mn)
+            if not fx:
+                continue
+            # build matchId exactly like the site does for a resolved knockout fixture:
+            #   dailyMatchId = `${date}_${homeISO}_${awayISO}`
+            # The site's home/away order = admin's koFixtures order (home first).
+            home_iso = id_to_iso.get(ph)
+            away_iso = id_to_iso.get(pa)
+            mid = f"{fx['date']}_{home_iso}_{away_iso}"
+            flipped = (home_iso, away_iso) != (h_iso, a_iso)
+            return mid, flipped
+    return None, False
+
+
 def extract_score(api_match):
     """Current score for live matches, full-time for finished. None if not started."""
     status = api_match.get("status", "")
@@ -188,6 +248,9 @@ def sync_once(fixtures, cache):
             continue
         mid, flipped = match_to_site_id(m, fixtures)
         if not mid:
+            # try knockout matching via admin-entered koFixtures
+            mid, flipped = ko_match_to_site_id(m, fixtures, KO_FIXTURES, ID_TO_ISO)
+        if not mid:
             continue
         h, a = score
         if flipped:
@@ -211,6 +274,8 @@ def sync_once(fixtures, cache):
         if m.get("status") != "FINISHED":
             continue
         mid, _ = match_to_site_id(m, fixtures)
+        if not mid:
+            mid, _ = ko_match_to_site_id(m, fixtures, KO_FIXTURES, ID_TO_ISO)
         if mid and not FINISHED_CACHE.get(mid):
             firebase_put(f"dailyFinished/{mid}", True)
             FINISHED_CACHE[mid] = True
@@ -220,6 +285,8 @@ def sync_once(fixtures, cache):
 
 
 FINISHED_CACHE = {}
+KO_FIXTURES = {}
+ID_TO_ISO = {}
 
 
 def finalize_groups(fixtures, scores):
@@ -276,6 +343,12 @@ def main():
     fixtures = load_fixtures()
     cache = firebase_get("dailyResults") or {}
     FINISHED_CACHE.update(firebase_get("dailyFinished") or {})
+    # Load knockout matchups (admin-entered) + teamId→iso map for KO result mapping
+    global KO_FIXTURES, ID_TO_ISO
+    ID_TO_ISO = load_team_id_to_iso()
+    KO_FIXTURES = fetch_ko_fixtures()
+    if KO_FIXTURES:
+        print(f"Loaded {len([k for k,v in KO_FIXTURES.items() if isinstance(v,dict) and v.get('home') and v.get('away')])} knockout matchup(s) from admin.")
 
     poll = int(os.environ.get("POLL_SECONDS", "60"))
     max_minutes = int(os.environ.get("MAX_MINUTES", "0"))  # 0 = single pass
@@ -303,6 +376,7 @@ def main():
 
     while datetime.now(timezone.utc) < deadline:
         try:
+            globals()["KO_FIXTURES"] = fetch_ko_fixtures()  # refresh admin matchups each poll
             live, _ = sync_once(fixtures, cache)
             idle_polls = 0 if live else idle_polls + 1
         except Exception as e:  # API hiccup — keep going
