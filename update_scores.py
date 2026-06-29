@@ -212,15 +212,25 @@ def ko_match_to_site_id(api_match, fixtures, ko_fixtures, id_to_iso):
 def extract_score(api_match):
     """Return (home, away, won_iso) for a match.
 
-    Score semantics:
-    - IN_PLAY / PAUSED: fullTime holds the running score during normal time.
-      Never fall back to halfTime — if fullTime is null (API glitch mid-VAR),
-      return None so this poll is skipped rather than writing a stale HT score.
-    - EXTRA_TIME / PENALTIES: extraTime holds the running score; fullTime is
-      frozen at 90-min result.
-    - FINISHED: prefer extraTime (120-min) when populated, else fullTime (90-min).
-      No halfTime fallback here either.
-    - won_iso: set only when a knockout is decided on penalties.
+    Display score = goals scored during open play (90' or 120'), never penalties.
+    football-data.org score structure:
+      fullTime  = running score during normal time; frozen at 90' once ET starts
+      extraTime = running score during ET (includes 90' goals); NOT populated
+                  during PENALTIES status (frozen at 120' value once ET ends)
+      penalties = penalty shootout tally (never shown in display)
+
+    Rules:
+    - IN_PLAY / PAUSED          → fullTime (running 90' score)
+    - EXTRA_TIME                → extraTime if populated, else fullTime (early ET)
+    - PENALTIES                 → fullTime (= 90' score, since extraTime may be
+                                   unreliable mid-shootout on some API versions)
+                                   BUT if fullTime == extraTime and both populated,
+                                   use extraTime (it holds the true 120' score)
+    - FINISHED                  → extraTime if populated AND winner==DRAW or
+                                   penalties decided the match; else fullTime.
+                                   Guard: if extraTime > fullTime on BOTH sides,
+                                   that means penalty scores leaked in — use fullTime.
+    - won_iso set only when a knockout is decided on penalties.
 
     Returns None if no usable score is available yet.
     """
@@ -229,38 +239,58 @@ def extract_score(api_match):
         return None
 
     sc = api_match.get("score", {})
-    ft = sc.get("fullTime",  {}) or {}
-    et = sc.get("extraTime", {}) or {}
-    ht = sc.get("halfTime",  {}) or {}
+    ft   = sc.get("fullTime",  {}) or {}
+    et   = sc.get("extraTime", {}) or {}
+    pens = sc.get("penalties", {}) or {}
+
+    ft_h, ft_a = ft.get("home"), ft.get("away")
+    et_h, et_a = et.get("home"), et.get("away")
+    ph,   pa   = pens.get("home"), pens.get("away")
 
     if status in ("IN_PLAY", "PAUSED"):
-        # fullTime = running score during normal time on football-data.org.
-        # Do NOT fall back to halfTime: a null fullTime means the API is
-        # momentarily inconsistent (e.g. during VAR review) — skip this poll.
-        h, a = ft.get("home"), ft.get("away")
+        # fullTime = live score during normal time. No halfTime fallback —
+        # if null, skip this poll (API glitch during VAR review).
+        h, a = ft_h, ft_a
 
-    elif status in ("EXTRA_TIME", "PENALTIES"):
-        # extraTime accumulates during ET; fullTime is frozen at 90'.
-        # Fall back to fullTime if extraTime not yet populated (very start of ET).
-        h = et.get("home") if et.get("home") is not None else ft.get("home")
-        a = et.get("away") if et.get("away") is not None else ft.get("away")
+    elif status == "EXTRA_TIME":
+        # extraTime accumulates during ET. Fall back to fullTime at ET kickoff
+        # before the API has populated extraTime.
+        h = et_h if et_h is not None else ft_h
+        a = et_a if et_a is not None else ft_a
+
+    elif status == "PENALTIES":
+        # During penalty shootout the display score is the 120' result.
+        # Prefer extraTime (true 120' score) if available; fall back to fullTime
+        # (which is the 90' score — still correct if no ET goals were scored,
+        # but extraTime is more accurate when ET goals exist).
+        if et_h is not None and et_a is not None:
+            h, a = et_h, et_a
+        else:
+            h, a = ft_h, ft_a
 
     else:
-        # FINISHED: prefer extraTime (true 120-min result) over fullTime (90-min).
-        if et.get("home") is not None and et.get("away") is not None:
-            h, a = et["home"], et["away"]
+        # FINISHED (and any unknown future status).
+        # Use extraTime when it is populated, UNLESS penalty scores leaked into
+        # it (detectable when extraTime > fullTime on BOTH sides simultaneously,
+        # which cannot happen from goals alone).
+        if et_h is not None and et_a is not None:
+            pen_leaked = (ph is not None and pa is not None and
+                          et_h == ft_h + ph and et_a == ft_a + pa)
+            if pen_leaked:
+                # API stuffed penalty tally into extraTime — use fullTime instead
+                h, a = ft_h, ft_a
+            else:
+                h, a = et_h, et_a
         else:
-            h, a = ft.get("home"), ft.get("away")
+            h, a = ft_h, ft_a
 
     if h is None or a is None:
         return None
     h, a = int(h), int(a)
 
-    # Penalty shootout winner (bracket needs this to auto-advance the winner).
+    # Penalty shootout winner (bracket needs this to auto-advance).
     won_iso = None
-    pens   = sc.get("penalties", {}) or {}
-    ph, pa = pens.get("home"), pens.get("away")
-    winner = sc.get("winner")
+    winner  = sc.get("winner")
     if h == a and (winner in ("HOME_TEAM", "AWAY_TEAM") or
                    (ph is not None and pa is not None)):
         if winner == "HOME_TEAM" or (ph is not None and pa is not None and ph > pa):
