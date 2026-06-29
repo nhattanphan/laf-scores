@@ -112,10 +112,14 @@ def http_json(url, headers=None, method="GET", body=None):
 
 
 def fetch_api_matches():
-    """World Cup matches around today (UTC), any status."""
+    """World Cup matches around today (UTC), any status.
+    Window is ±1 day to catch matches that started yesterday (late kickoffs)
+    or are scheduled tomorrow (early UTC kickoffs in Asia/Pacific slots).
+    Extra time / penalty shootouts can push a match >2h past kickoff, so we
+    always include yesterday to avoid dropping a match mid-ET at midnight UTC."""
     today = datetime.now(timezone.utc).date()
     date_from = (today - timedelta(days=1)).isoformat()
-    date_to = (today + timedelta(days=1)).isoformat()
+    date_to   = (today + timedelta(days=1)).isoformat()
     url = f"{API_BASE}/competitions/WC/matches?dateFrom={date_from}&dateTo={date_to}"
     data = http_json(url, headers={"X-Auth-Token": API_TOKEN})
     return data.get("matches", [])
@@ -207,23 +211,49 @@ def ko_match_to_site_id(api_match, fixtures, ko_fixtures, id_to_iso):
 
 def extract_score(api_match):
     """Return (home, away, won_iso) for a match.
-    home/away = the 120-minute score (full-time as reported, excluding penalties).
-    won_iso  = ISO of the winner when a knockout is decided on penalties (else None).
-    Returns None if the match has not produced a usable score yet."""
+
+    Score semantics:
+    - IN_PLAY / PAUSED / EXTRA_TIME / PENALTIES: use the best available live
+      score (fullTime first, then extraTime, then halfTime) so the display
+      always shows current goals even during ET/shootout.
+    - FINISHED: use fullTime (the authoritative 90-min or 120-min result).
+    - won_iso: set only when a knockout is decided on penalties.
+
+    Returns None if no usable score is available yet.
+    """
     status = api_match.get("status", "")
     if status in ("SCHEDULED", "TIMED", "POSTPONED", "CANCELLED"):
         return None
+
     sc = api_match.get("score", {})
-    ft = sc.get("fullTime", {}) or {}
-    h, a = ft.get("home"), ft.get("away")
-    if h is None or a is None:
-        # live matches sometimes only populate halves
-        ht = sc.get("halfTime", {}) or {}
-        h = h if h is not None else ht.get("home")
-        a = a if a is not None else ht.get("away")
+    ft  = sc.get("fullTime",  {}) or {}
+    et  = sc.get("extraTime", {}) or {}   # populated during/after ET
+    ht  = sc.get("halfTime",  {}) or {}
+
+    # For live matches prefer the most advanced score reported by the API.
+    # football-data.org populates extraTime.home/away during EXTRA_TIME and
+    # PENALTIES statuses; fullTime is frozen at 90-min result until FINISHED.
+    if status in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTIES"):
+        # extraTime has the running 90+ET score during these phases
+        h = et.get("home") if et.get("home") is not None else ft.get("home")
+        a = et.get("away") if et.get("away") is not None else ft.get("away")
+        if h is None or a is None:
+            h, a = ht.get("home"), ht.get("away")
+    else:
+        # FINISHED: prefer extraTime (120-min score) when it is populated,
+        # otherwise fall back to fullTime (90-min) → handles both normal and ET matches.
+        if et.get("home") is not None and et.get("away") is not None:
+            h, a = int(et["home"]), int(et["away"])
+        else:
+            h, a = ft.get("home"), ft.get("away")
+            if h is None or a is None:
+                h = ht.get("home")
+                a = ht.get("away")
+
     if h is None or a is None:
         return None
     h, a = int(h), int(a)
+
     # Penalty shootout: when the 120-min score is level but the API names a winner,
     # capture which side advanced so the bracket can progress automatically.
     won_iso = None
@@ -254,46 +284,85 @@ def firebase_put(path, value):
             print(f"  ⚠ write failed on {base}: {e}", flush=True)
 
 
+
+# Statuses that count as "live" (match clock running or paused between halves/ET)
+_LIVE_STATUSES = {"IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTIES"}
+# Statuses where the match might still change (broader than live — used for ET/pen decisions)
+_ACTIVE_STATUSES = _LIVE_STATUSES | {"SUSPENDED"}
+
+
+def _is_var_cancel(prev, h, a):
+    """Return True if the new score is lower than the cached score on either side.
+    A score can only decrease legitimately via a VAR-cancelled goal.
+    prev is the cache dict {"h": int, "a": int, ...}."""
+    if prev is None:
+        return False
+    return h < int(prev.get("h", 0)) or a < int(prev.get("a", 0))
+
+
 def sync_once(fixtures, cache):
-    """One API poll → Firebase writes for changed scores. Returns (#live, #updates)."""
+    """One API poll → Firebase writes for changed scores.
+    Returns (#live, #updates, has_et) where has_et signals an ET/penalty match."""
     matches = fetch_api_matches()
-    live = sum(1 for m in matches if m.get("status") in ("IN_PLAY", "PAUSED"))
+    live    = sum(1 for m in matches if m.get("status") in _LIVE_STATUSES)
+    has_et  = any(m.get("status") in {"EXTRA_TIME", "PENALTIES"} for m in matches)
     updates = 0
+
     for m in matches:
         score = extract_score(m)
         if score is None:
             continue
         mid, flipped = match_to_site_id(m, fixtures)
         if not mid:
-            # try knockout matching via admin-entered koFixtures
             mid, flipped = ko_match_to_site_id(m, fixtures, KO_FIXTURES, ID_TO_ISO)
         if not mid:
             continue
+
         h, a, won_iso = score
         if flipped:
             h, a = a, h
-            # won_iso is an ISO code, unaffected by home/away flip
+
+        status = m.get("status", "")
         minute = None
-        if m.get("status") in ("IN_PLAY", "PAUSED"):
+        if status in _ACTIVE_STATUSES:
             minute = m.get("minute") or m.get("score", {}).get("minute")
+
+        # ── VAR sanity check ──────────────────────────────────────────────────
+        # If the API reports a lower score than what we last wrote, a VAR-
+        # cancelled goal has occurred.  Always write immediately regardless of
+        # any other change-detection logic so the site reflects the correction.
+        prev       = cache.get(mid)
+        var_cancel = _is_var_cancel(prev, h, a)
+        if var_cancel:
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"  [{ts} UTC] ⚠ VAR cancel detected for {mid}: "
+                  f"{prev} → {h}–{a}", flush=True)
+
         new_val = {"h": h, "a": a}
         if minute is not None:
             new_val["min"] = int(minute)
         if won_iso:
-            new_val["won"] = won_iso  # penalty-shootout winner (bracket advances on this)
-        # change detection: compare the meaningful fields (h, a, won)
-        prev = cache.get(mid)
+            new_val["won"] = won_iso
+
+        # change detection (h, a, won); also force-write on VAR cancel or live
         cur_cmp = {"h": h, "a": a}
         if won_iso:
             cur_cmp["won"] = won_iso
-        if prev == cur_cmp and m.get("status") not in ("IN_PLAY", "PAUSED"):
-            continue  # no change → no write
+
+        force_write = var_cancel or status in _ACTIVE_STATUSES
+        if prev == cur_cmp and not force_write:
+            continue  # no change, not live → skip
+
         firebase_put(f"dailyResults/{mid}", new_val)
         cache[mid] = cur_cmp
         updates += 1
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         pen_note = f" (pen → {won_iso})" if won_iso else ""
-        print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a}{pen_note} ({m.get('status')})", flush=True)
+        et_note  = " [ET]" if status in {"EXTRA_TIME", "PENALTIES"} else ""
+        var_note = " ⚠VAR" if var_cancel else ""
+        print(f"  [{ts} UTC] ✅ {mid} ← {h}–{a}{pen_note}{et_note}{var_note} ({status})",
+              flush=True)
+
     # mark finished matches (needed to know when a group is truly complete)
     for m in matches:
         if m.get("status") != "FINISHED":
@@ -304,9 +373,11 @@ def sync_once(fixtures, cache):
         if mid and not FINISHED_CACHE.get(mid):
             firebase_put(f"dailyFinished/{mid}", True)
             FINISHED_CACHE[mid] = True
+
     if updates or any(m.get("status") == "FINISHED" for m in matches):
         finalize_groups(fixtures, cache)
-    return live, updates
+
+    return live, updates, has_et
 
 
 FINISHED_CACHE = {}
@@ -370,26 +441,37 @@ def main():
     fixtures = load_fixtures()
     cache = firebase_get("dailyResults") or {}
     FINISHED_CACHE.update(firebase_get("dailyFinished") or {})
-    # Load knockout matchups (admin-entered) + teamId→iso map for KO result mapping
     global KO_FIXTURES, ID_TO_ISO
-    ID_TO_ISO = load_team_id_to_iso()
+    ID_TO_ISO  = load_team_id_to_iso()
     KO_FIXTURES = fetch_ko_fixtures()
     if KO_FIXTURES:
-        print(f"Loaded {len([k for k,v in KO_FIXTURES.items() if isinstance(v,dict) and v.get('home') and v.get('away')])} knockout matchup(s) from admin.")
+        n = len([k for k, v in KO_FIXTURES.items()
+                 if isinstance(v, dict) and v.get("home") and v.get("away")])
+        print(f"Loaded {n} knockout matchup(s) from admin.")
 
-    poll = int(os.environ.get("POLL_SECONDS", "60"))
+    # POLL_SECONDS: interval when live match is running (default 30s for faster updates)
+    poll_live = int(os.environ.get("POLL_SECONDS", "30"))
+    # POLL_IDLE_SECONDS: interval when no live match (default 60s to save rate-limit quota)
+    poll_idle = int(os.environ.get("POLL_IDLE_SECONDS", "60"))
     max_minutes = int(os.environ.get("MAX_MINUTES", "0"))  # 0 = single pass
 
     if max_minutes <= 0:
-        live, updates = sync_once(fixtures, cache)
+        live, updates, _ = sync_once(fixtures, cache)
         print(f"Done. {updates} update(s) written.")
         return
 
-    # ── LIVE polling mode: poll every `poll` seconds for up to `max_minutes` ──
+    # ── LIVE polling mode ────────────────────────────────────────────────────
+    # Polls every poll_live seconds when a match is in progress, poll_idle
+    # otherwise.  The deadline is extended automatically when a match enters
+    # extra time or a penalty shootout so we never stop mid-ET.
     import time
     deadline = datetime.now(timezone.utc) + timedelta(minutes=max_minutes)
     idle_polls = 0
-    print(f"Live mode: polling every {poll}s until {deadline:%H:%M} UTC.", flush=True)
+    et_active  = False          # True while any match is in ET/penalties
+    et_grace   = timedelta(minutes=45)   # max extra grace when ET detected
+
+    print(f"Live mode: poll {poll_live}s (live) / {poll_idle}s (idle) "
+          f"until {deadline:%H:%M} UTC.", flush=True)
 
     def next_kickoff_utc():
         """Earliest future kickoff (fixtures are CEST = UTC+2 during the tournament)."""
@@ -401,29 +483,50 @@ def main():
                 best = ko
         return best
 
-    while datetime.now(timezone.utc) < deadline:
+    while True:
+        now = datetime.now(timezone.utc)
+
+        # ── Deadline check (with ET extension) ──────────────────────────────
+        # If we're past the scheduled deadline but a match is still in ET /
+        # penalties, extend deadline by et_grace so we don't drop mid-match.
+        if now >= deadline:
+            if et_active:
+                deadline = now + et_grace
+                print(f"  ⏱ ET/Pen in progress — extending deadline to "
+                      f"{deadline:%H:%M} UTC.", flush=True)
+                et_active = False   # will be re-set next poll if still active
+            else:
+                break
+
         try:
-            globals()["KO_FIXTURES"] = fetch_ko_fixtures()  # refresh admin matchups each poll
-            live, _ = sync_once(fixtures, cache)
+            globals()["KO_FIXTURES"] = fetch_ko_fixtures()
+            live, _, has_et = sync_once(fixtures, cache)
+            et_active  = has_et
             idle_polls = 0 if live else idle_polls + 1
-        except Exception as e:  # API hiccup — keep going
+        except Exception as e:
             print(f"  ⚠ poll failed: {e}", flush=True)
 
         if idle_polls >= 30:
-            # nothing live for ~30 min — is a kickoff coming before this session ends?
             ko = next_kickoff_utc()
             if ko is None or ko > deadline:
-                print("No live matches and no kickoff before session end — stopping early.", flush=True)
+                print("No live matches and no kickoff before session end — stopping early.",
+                      flush=True)
                 break
             wait = (ko - datetime.now(timezone.utc)).total_seconds()
             if wait > 360:
-                # idle until ~5 min before kickoff, pinging every 5 min to stay warm
                 print(f"Next kickoff {ko:%H:%M} UTC — idling until then.", flush=True)
                 time.sleep(min(wait - 300, 300))
                 continue
             idle_polls = 0  # kickoff imminent — resume normal polling
-        time.sleep(poll)
+
+        # Adaptive sleep: fast when live, slow when idle
+        interval = poll_live if live else poll_idle
+        time.sleep(interval)
+
     print("Live polling session finished.")
+
+
+
 
 
 if __name__ == "__main__":
