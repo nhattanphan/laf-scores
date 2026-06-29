@@ -213,10 +213,13 @@ def extract_score(api_match):
     """Return (home, away, won_iso) for a match.
 
     Score semantics:
-    - IN_PLAY / PAUSED / EXTRA_TIME / PENALTIES: use the best available live
-      score (fullTime first, then extraTime, then halfTime) so the display
-      always shows current goals even during ET/shootout.
-    - FINISHED: use fullTime (the authoritative 90-min or 120-min result).
+    - IN_PLAY / PAUSED: fullTime holds the running score during normal time.
+      Never fall back to halfTime — if fullTime is null (API glitch mid-VAR),
+      return None so this poll is skipped rather than writing a stale HT score.
+    - EXTRA_TIME / PENALTIES: extraTime holds the running score; fullTime is
+      frozen at 90-min result.
+    - FINISHED: prefer extraTime (120-min) when populated, else fullTime (90-min).
+      No halfTime fallback here either.
     - won_iso: set only when a knockout is decided on penalties.
 
     Returns None if no usable score is available yet.
@@ -226,41 +229,40 @@ def extract_score(api_match):
         return None
 
     sc = api_match.get("score", {})
-    ft  = sc.get("fullTime",  {}) or {}
-    et  = sc.get("extraTime", {}) or {}   # populated during/after ET
-    ht  = sc.get("halfTime",  {}) or {}
+    ft = sc.get("fullTime",  {}) or {}
+    et = sc.get("extraTime", {}) or {}
+    ht = sc.get("halfTime",  {}) or {}
 
-    # For live matches prefer the most advanced score reported by the API.
-    # football-data.org populates extraTime.home/away during EXTRA_TIME and
-    # PENALTIES statuses; fullTime is frozen at 90-min result until FINISHED.
-    if status in ("IN_PLAY", "PAUSED", "EXTRA_TIME", "PENALTIES"):
-        # extraTime has the running 90+ET score during these phases
+    if status in ("IN_PLAY", "PAUSED"):
+        # fullTime = running score during normal time on football-data.org.
+        # Do NOT fall back to halfTime: a null fullTime means the API is
+        # momentarily inconsistent (e.g. during VAR review) — skip this poll.
+        h, a = ft.get("home"), ft.get("away")
+
+    elif status in ("EXTRA_TIME", "PENALTIES"):
+        # extraTime accumulates during ET; fullTime is frozen at 90'.
+        # Fall back to fullTime if extraTime not yet populated (very start of ET).
         h = et.get("home") if et.get("home") is not None else ft.get("home")
         a = et.get("away") if et.get("away") is not None else ft.get("away")
-        if h is None or a is None:
-            h, a = ht.get("home"), ht.get("away")
+
     else:
-        # FINISHED: prefer extraTime (120-min score) when it is populated,
-        # otherwise fall back to fullTime (90-min) → handles both normal and ET matches.
+        # FINISHED: prefer extraTime (true 120-min result) over fullTime (90-min).
         if et.get("home") is not None and et.get("away") is not None:
-            h, a = int(et["home"]), int(et["away"])
+            h, a = et["home"], et["away"]
         else:
             h, a = ft.get("home"), ft.get("away")
-            if h is None or a is None:
-                h = ht.get("home")
-                a = ht.get("away")
 
     if h is None or a is None:
         return None
     h, a = int(h), int(a)
 
-    # Penalty shootout: when the 120-min score is level but the API names a winner,
-    # capture which side advanced so the bracket can progress automatically.
+    # Penalty shootout winner (bracket needs this to auto-advance the winner).
     won_iso = None
-    pens = sc.get("penalties", {}) or {}
+    pens   = sc.get("penalties", {}) or {}
     ph, pa = pens.get("home"), pens.get("away")
-    winner = sc.get("winner")  # "HOME_TEAM" | "AWAY_TEAM" | "DRAW" | None
-    if h == a and (winner in ("HOME_TEAM", "AWAY_TEAM") or (ph is not None and pa is not None)):
+    winner = sc.get("winner")
+    if h == a and (winner in ("HOME_TEAM", "AWAY_TEAM") or
+                   (ph is not None and pa is not None)):
         if winner == "HOME_TEAM" or (ph is not None and pa is not None and ph > pa):
             won_iso = api_name_to_iso(api_match["homeTeam"]["name"])
         elif winner == "AWAY_TEAM" or (ph is not None and pa is not None and pa > ph):
@@ -292,12 +294,42 @@ _ACTIVE_STATUSES = _LIVE_STATUSES | {"SUSPENDED"}
 
 
 def _is_var_cancel(prev, h, a):
-    """Return True if the new score is lower than the cached score on either side.
-    A score can only decrease legitimately via a VAR-cancelled goal.
+    """Return True if the new score is exactly 1 lower on one side — a VAR
+    cancelled goal.  Returns False (= skip write) for anything else that looks
+    like a decrease, because a drop of >1 goal during a live match is always
+    an API glitch (e.g. transient null→halfTime fallback that was fixed in
+    extract_score, but belt-and-suspenders here).
     prev is the cache dict {"h": int, "a": int, ...}."""
     if prev is None:
         return False
-    return h < int(prev.get("h", 0)) or a < int(prev.get("a", 0))
+    ph, pa = int(prev.get("h", 0)), int(prev.get("a", 0))
+    h_drop = ph - h
+    a_drop = pa - a
+    # Legitimate VAR cancel: exactly one side drops by exactly 1
+    if h_drop == 1 and a_drop == 0:
+        return True
+    if a_drop == 1 and h_drop == 0:
+        return True
+    # Any other decrease → API glitch, do NOT write
+    return False
+
+
+def _is_api_glitch(prev, h, a):
+    """Return True when the score decreased in a way that is impossible legitimately:
+    - Either side drops by more than 1 goal, OR
+    - Both sides drop simultaneously (e.g. 2-1 → 1-0: home -1, away -1).
+    A single-side drop of exactly 1 is a legitimate VAR cancel."""
+    if prev is None:
+        return False
+    ph, pa = int(prev.get("h", 0)), int(prev.get("a", 0))
+    h_drop = ph - h
+    a_drop = pa - a
+    if h_drop > 1 or a_drop > 1:
+        return True
+    # Both sides dropped simultaneously → impossible, must be a glitch
+    if h_drop > 0 and a_drop > 0:
+        return True
+    return False
 
 
 def sync_once(fixtures, cache):
@@ -327,12 +359,21 @@ def sync_once(fixtures, cache):
         if status in _ACTIVE_STATUSES:
             minute = m.get("minute") or m.get("score", {}).get("minute")
 
-        # ── VAR sanity check ──────────────────────────────────────────────────
-        # If the API reports a lower score than what we last wrote, a VAR-
-        # cancelled goal has occurred.  Always write immediately regardless of
-        # any other change-detection logic so the site reflects the correction.
+        # ── VAR / glitch guard ────────────────────────────────────────────────
         prev       = cache.get(mid)
         var_cancel = _is_var_cancel(prev, h, a)
+        api_glitch = _is_api_glitch(prev, h, a)
+
+        if api_glitch:
+            # Score dropped by >1 goal — impossible legitimately. API is
+            # returning a transient bad value (e.g. fullTime momentarily null
+            # during VAR review, previously caught by halfTime fallback).
+            # Skip this poll entirely; do NOT update Firebase or cache.
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"  [{ts} UTC] 🚫 API glitch skipped for {mid}: "
+                  f"cache={prev} → API={h}–{a} (drop >1, ignoring)", flush=True)
+            continue
+
         if var_cancel:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             print(f"  [{ts} UTC] ⚠ VAR cancel detected for {mid}: "
