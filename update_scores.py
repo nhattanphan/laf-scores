@@ -269,7 +269,18 @@ def extract_score(api_match):
             won_iso = api_name_to_iso(api_match["homeTeam"]["name"])
         elif winner == "AWAY_TEAM" or (p_h is not None and p_a is not None and p_a > p_h):
             won_iso = api_name_to_iso(api_match["awayTeam"]["name"])
-    return h, a, won_iso, in_shootout
+
+    # Extras for the site:
+    #   h90/a90 = 90-minute score (regularTime) — the site grades daily picks
+    #             on this, so an ET goal doesn't rob a correct 90' prediction.
+    #   ph/pa   = penalty shootout tally — shown as "1–1 (4–2 t.a.b.)".
+    extra = {}
+    rt_h, rt_a = rt.get("home"), rt.get("away")
+    if duration != "REGULAR" and rt_h is not None and rt_a is not None:
+        extra["h90"], extra["a90"] = int(rt_h), int(rt_a)
+    if p_h is not None and p_a is not None:
+        extra["ph"], extra["pa"] = int(p_h), int(p_a)
+    return h, a, won_iso, in_shootout, extra
 
 
 def firebase_get(path, base=None):
@@ -352,9 +363,13 @@ def sync_once(fixtures, cache):
         if not mid:
             continue
 
-        h, a, won_iso, in_shootout = score
+        h, a, won_iso, in_shootout, extra = score
         if flipped:
             h, a = a, h
+            if "h90" in extra:
+                extra["h90"], extra["a90"] = extra["a90"], extra["h90"]
+            if "ph" in extra:
+                extra["ph"], extra["pa"] = extra["pa"], extra["ph"]
 
         status = m.get("status", "")
         minute = None
@@ -385,14 +400,14 @@ def sync_once(fixtures, cache):
             print(f"  [{ts} UTC] ⚠ VAR cancel detected for {mid}: "
                   f"{prev} → {h}–{a}", flush=True)
 
-        new_val = {"h": h, "a": a}
+        new_val = {"h": h, "a": a, **extra}
         if minute is not None:
             new_val["min"] = int(minute)
         if won_iso:
             new_val["won"] = won_iso
 
-        # change detection (h, a, won); also force-write on VAR cancel or live
-        cur_cmp = {"h": h, "a": a}
+        # change detection (h, a, won, extras); also force-write on VAR cancel or live
+        cur_cmp = {"h": h, "a": a, **extra}
         if won_iso:
             cur_cmp["won"] = won_iso
 
