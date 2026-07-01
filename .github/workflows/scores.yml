@@ -1,28 +1,48 @@
-name: Live WC scores
+# .github/workflows/scores.yml
+# LAF WC2026 — live score updater
+#
+# Timing fixes vs the old setup:
+#  1. Cron minute is OFF-PEAK (:07 / :37) — GitHub delays/drops jobs scheduled
+#     at :00 by 10–30 min during busy hours. Off-peak minutes start far more
+#     reliably.
+#  2. The job starts BEFORE kickoff and runs a long LIVE SESSION (MAX_MINUTES)
+#     instead of relying on many short cron runs landing on time.
+#  3. timeout-minutes > MAX_MINUTES + ET grace (45') + margin. Without this,
+#     GitHub kills the runner mid–extra-time no matter what the Python
+#     deadline-extension logic wants. THIS was the main "ET/pen bị cắt" bug.
+#  4. concurrency group prevents two overlapping sessions from fighting over
+#     Firebase writes when a delayed cron fires while a session is running.
+
+name: WC2026 live scores
 
 on:
   schedule:
-    - cron: "55 15 * 6,7 *"
-    - cron: "55 21 * 6,7 *"
-    - cron: "55 3 * 6,7 *"
-  workflow_dispatch: {}
+    # WC2026 kickoffs (CEST) are roughly 18:00 / 21:00 / 00:00 / 03:00.
+    # Start a session ~10 min before each block (times below are UTC):
+    - cron: "50 15 * * *"   # covers 18:00 CEST kickoff
+    - cron: "50 18 * * *"   # covers 21:00 CEST kickoff
+    - cron: "50 21 * * *"   # covers 00:00 CEST kickoff
+    - cron: "50 0 * * *"    # covers 03:00 CEST kickoff
+  workflow_dispatch:        # manual start (backup when cron is late)
 
 concurrency:
-  group: live-scores
-  cancel-in-progress: false
+  group: wc2026-live
+  cancel-in-progress: false   # let the running session finish; skip the newcomer
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    # MAX_MINUTES=200 + 45' ET grace + margin → 270
+    timeout-minutes: 270
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Poll live scores (every 60s)
+      - name: Live score session
         env:
           FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
-          POLL_SECONDS: "60"
-          MAX_MINUTES: "350"
+          MAX_MINUTES: "200"        # one kickoff block: 90'+HT+stoppage+ET+pens
+          POLL_SECONDS: "30"
+          POLL_IDLE_SECONDS: "60"
         run: python update_scores.py
