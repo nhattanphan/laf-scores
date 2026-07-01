@@ -212,92 +212,64 @@ def ko_match_to_site_id(api_match, fixtures, ko_fixtures, id_to_iso):
 def extract_score(api_match):
     """Return (home, away, won_iso) for a match.
 
-    Display score = goals scored during open play (90' or 120'), never penalties.
-    football-data.org score structure:
-      fullTime  = running score during normal time; frozen at 90' once ET starts
-      extraTime = running score during ET (includes 90' goals); NOT populated
-                  during PENALTIES status (frozen at 120' value once ET ends)
-      penalties = penalty shootout tally (never shown in display)
+    football-data.org **v4** semantics (docs/general/v4/overtime.html):
+      fullTime    = RUNNING TOTAL score. Set to 0 at kickoff, keeps counting
+                    through ET *and* the penalty shootout. A match decided on
+                    pens shows e.g. 1-1 (120') + 6-5 (pens) as fullTime 7-6.
+      regularTime = score after 90' (v4 only; appears for knockout matches)
+      extraTime   = ONLY the goals scored during extra time (starts at 0)
+      penalties   = ONLY the goals of the shootout
+      duration    = REGULAR | EXTRA_TIME | PENALTY_SHOOTOUT
 
-    Rules:
-    - IN_PLAY / PAUSED          → fullTime (running 90' score)
-    - EXTRA_TIME                → extraTime if populated, else fullTime (early ET)
-    - PENALTIES                 → fullTime (= 90' score, since extraTime may be
-                                   unreliable mid-shootout on some API versions)
-                                   BUT if fullTime == extraTime and both populated,
-                                   use extraTime (it holds the true 120' score)
-    - FINISHED                  → extraTime if populated AND winner==DRAW or
-                                   penalties decided the match; else fullTime.
-                                   Guard: if extraTime > fullTime on BOTH sides,
-                                   that means penalty scores leaked in — use fullTime.
-    - won_iso set only when a knockout is decided on penalties.
-
+    Display score = open-play goals (90' or 120'), never penalties:
+      → fullTime minus penalties whenever a shootout is/was in progress,
+        cross-checked against regularTime + extraTime when available.
+    won_iso is set only when a knockout is decided on penalties.
     Returns None if no usable score is available yet.
     """
     status = api_match.get("status", "")
     if status in ("SCHEDULED", "TIMED", "POSTPONED", "CANCELLED"):
         return None
 
-    sc = api_match.get("score", {})
-    ft   = sc.get("fullTime",  {}) or {}
-    et   = sc.get("extraTime", {}) or {}
-    pens = sc.get("penalties", {}) or {}
+    sc   = api_match.get("score", {}) or {}
+    ft   = sc.get("fullTime",    {}) or {}
+    rt   = sc.get("regularTime", {}) or {}
+    et   = sc.get("extraTime",   {}) or {}
+    pens = sc.get("penalties",   {}) or {}
+    duration = sc.get("duration") or "REGULAR"
 
     ft_h, ft_a = ft.get("home"), ft.get("away")
-    et_h, et_a = et.get("home"), et.get("away")
-    ph,   pa   = pens.get("home"), pens.get("away")
+    if ft_h is None or ft_a is None:
+        return None  # API glitch mid-poll (e.g. VAR review) — skip this poll
+    h, a = int(ft_h), int(ft_a)
 
-    if status in ("IN_PLAY", "PAUSED"):
-        # fullTime = live score during normal time. No halfTime fallback —
-        # if null, skip this poll (API glitch during VAR review).
-        h, a = ft_h, ft_a
+    p_h, p_a = pens.get("home"), pens.get("away")
+    in_shootout = (duration == "PENALTY_SHOOTOUT" or status == "PENALTIES"
+                   or (p_h is not None and p_a is not None))
+    if in_shootout:
+        # Strip shootout goals out of the running total → true 120' score.
+        h -= int(p_h or 0)
+        a -= int(p_a or 0)
+        # Cross-check with regularTime + extraTime (authoritative when present).
+        rt_h, rt_a = rt.get("home"), rt.get("away")
+        if rt_h is not None and rt_a is not None:
+            alt_h = int(rt_h) + int(et.get("home") or 0)
+            alt_a = int(rt_a) + int(et.get("away") or 0)
+            if (alt_h, alt_a) != (h, a):
+                h, a = alt_h, alt_a
 
-    elif status == "EXTRA_TIME":
-        # extraTime accumulates during ET. Fall back to fullTime at ET kickoff
-        # before the API has populated extraTime.
-        h = et_h if et_h is not None else ft_h
-        a = et_a if et_a is not None else ft_a
-
-    elif status == "PENALTIES":
-        # During penalty shootout the display score is the 120' result.
-        # Prefer extraTime (true 120' score) if available; fall back to fullTime
-        # (which is the 90' score — still correct if no ET goals were scored,
-        # but extraTime is more accurate when ET goals exist).
-        if et_h is not None and et_a is not None:
-            h, a = et_h, et_a
-        else:
-            h, a = ft_h, ft_a
-
-    else:
-        # FINISHED (and any unknown future status).
-        # Use extraTime when it is populated, UNLESS penalty scores leaked into
-        # it (detectable when extraTime > fullTime on BOTH sides simultaneously,
-        # which cannot happen from goals alone).
-        if et_h is not None and et_a is not None:
-            pen_leaked = (ph is not None and pa is not None and
-                          et_h == ft_h + ph and et_a == ft_a + pa)
-            if pen_leaked:
-                # API stuffed penalty tally into extraTime — use fullTime instead
-                h, a = ft_h, ft_a
-            else:
-                h, a = et_h, et_a
-        else:
-            h, a = ft_h, ft_a
-
-    if h is None or a is None:
-        return None
-    h, a = int(h), int(a)
+    if h < 0 or a < 0:
+        return None  # inconsistent transient API state — skip this poll
 
     # Penalty shootout winner (bracket needs this to auto-advance).
     won_iso = None
     winner  = sc.get("winner")
-    if h == a and (winner in ("HOME_TEAM", "AWAY_TEAM") or
-                   (ph is not None and pa is not None)):
-        if winner == "HOME_TEAM" or (ph is not None and pa is not None and ph > pa):
+    if duration == "PENALTY_SHOOTOUT" and status == "FINISHED":
+        if winner == "HOME_TEAM" or (p_h is not None and p_a is not None and p_h > p_a):
             won_iso = api_name_to_iso(api_match["homeTeam"]["name"])
-        elif winner == "AWAY_TEAM" or (ph is not None and pa is not None and pa > ph):
+        elif winner == "AWAY_TEAM" or (p_h is not None and p_a is not None and p_a > p_h):
             won_iso = api_name_to_iso(api_match["awayTeam"]["name"])
-    return h, a, won_iso
+    return h, a, won_iso, in_shootout
 
 
 def firebase_get(path, base=None):
@@ -380,7 +352,7 @@ def sync_once(fixtures, cache):
         if not mid:
             continue
 
-        h, a, won_iso = score
+        h, a, won_iso, in_shootout = score
         if flipped:
             h, a = a, h
 
@@ -390,9 +362,13 @@ def sync_once(fixtures, cache):
             minute = m.get("minute") or m.get("score", {}).get("minute")
 
         # ── VAR / glitch guard ────────────────────────────────────────────────
+        # Guard is DISABLED while/after a shootout: the corrected 120' score is
+        # legitimately lower than an inflated fullTime (e.g. 7–6 → 1–1) that an
+        # older run may have cached, and pens-in-progress never add open-play
+        # goals anyway.
         prev       = cache.get(mid)
-        var_cancel = _is_var_cancel(prev, h, a)
-        api_glitch = _is_api_glitch(prev, h, a)
+        var_cancel = (not in_shootout) and _is_var_cancel(prev, h, a)
+        api_glitch = (not in_shootout) and _is_api_glitch(prev, h, a)
 
         if api_glitch:
             # Score dropped by >1 goal — impossible legitimately. API is
